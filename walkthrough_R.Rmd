@@ -1,0 +1,203 @@
+---
+title: "Supplemental Code File -- R"
+output: html_notebook
+---
+
+
+```{r options, echo = FALSE}
+library(knitr)
+knitr::opts_chunk$set(
+  comment = "#>"
+)
+```
+
+
+# Introduction
+These two vignettes contain walk-throughs of machine learning development in both R and in Python. 
+These tutorials aim to outline the basic steps in training and assessing ML models.
+The details presented are not meant to discuss the every detail of best practices in machine learning nor do they necessarily show how to develop the best performing model.
+Instead, the goals are to provide a clear example of how we go from data to predictions in the ML framework and to illustrate general machine learning principles.
+
+# A machine learning walkthrough in R
+## Loading packages and data
+We start by making sure that the required packages are installed in R.
+We will be using the `tidyverse` package, which is a set of "opinionated" R packages that are designed to make data science simpler with human-readable, reproducible code.
+For the ML model, we will be using an implementation of extreme gradient boosted trees provided in the `xgboost` package, and we will use a function called `split_train_test()` from the `healthcareai` package.
+
+```{r r-setup}
+install.packages(setdiff(c("tidyverse", "xgboost", "healthcareai", "ROCR"),
+                         rownames(installed.packages())))  
+```
+
+Once the packages are installed, we can load our packages.
+
+
+```{r load-packages, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(xgboost)
+library(ROCR)
+library(healthcareai)
+```
+
+
+## Data processing
+We proceed by loading our data into R.
+The variable `path_to_data` is the location of the csv file with the data, and the function `read_csv()` will import the data into a tibble.
+
+Each row represents a patient, and the column contains the data for each patient.
+The tibble contains an identifying `SID` for each patient, the patient's `SEX`, concentrations of different amino acids, alloisoleucine in `Allo`, homocysteine in `Hcys`, and argininosuccinic acid lyase deficiency in `ASA`.
+The `Class` column contains the "labels" normal and abnormal for each PAA profile.
+
+
+```{r r-load-data, message = FALSE}
+path_to_data <- "/Users/ed/git/ml_review_paper/data/clc317479-file001.csv"
+df <- read_csv(path_to_data)
+df   # print a preview of the data frame
+```
+
+
+In order to prepare our tibble for machine learning purposes, we need to prepare our data into a form that the machine learning algorithms will accept.
+
+1. We need to get rid any features that we will not input into the algorithm.
+In this case, we will need to remove the patient identifiers (the `SID` column).
+We do this by using the `select()` function to remove the `SID` column
+
+2. We need to convert any categorical variables into numerical codes.
+For example, the `SEX` column has values of `F` for female, `M` for male, and `U` for unidentified.
+We can use the `mutate()` function to convert these values to numbers in combination with the `case_when()` helper function to let `mutate()` to know which categorical values should become which numbers.
+
+
+```{r r-conversion}
+# remove the SID column
+df <- df %>% select(-SID)
+
+# convert categorical variables to numerical codes
+df <- df %>% 
+  mutate(
+    SEX = case_when(
+      SEX == "F" ~ 0,
+      SEX == "M" ~ 1,
+      SEX == "U" ~ 2)) %>%
+  mutate(
+    ASA = case_when(
+      ASA == "N" ~ 0,
+      ASA == "Y" ~ 1)) %>%
+  mutate(
+    Allo = case_when(
+      Allo == "N" ~ 0,
+      Allo == "Y" ~ 1)) %>%
+  mutate(
+    Hcys = case_when(
+      Hcys == "N" ~ 0,
+      Hcys == "Y" ~ 1
+    )
+  )
+
+# convert labels from text to numerical codes to a factor as required
+# by the machine learning algorithms
+df <- df %>%
+  mutate(Class = case_when(
+    Class == "No.significant.abnormality.detected." ~ 0,
+    Class == "X.Abnormal" ~ 1
+  ))
+```
+
+
+
+
+
+## Splitting our data into a training, test, and validation set
+
+```{r r-split-train-test}
+my_seed <- 7
+test_size = 0.3
+val_size  = 0.2
+
+# split dataset into train and test datasets
+traintest <- split_train_test(df,
+                              outcome = Class,
+                              percent_train = 1 - test_size,
+                              seed = my_seed)
+
+# split the initial train data frame into a small train set and a validation set
+trainval  <- split_train_test(traintest$train,
+                              outcome = Class,
+                              percent_train = 1 - val_size,
+                              seed = my_seed)
+
+df_test  <- traintest$test
+df_train <- trainval$train
+df_val   <- trainval$test
+
+
+dtest  <- xgb.DMatrix(data = select(df_test, -Class) %>% as.matrix(),
+                      label = select(df_test, Class) %>% as.matrix())
+dtrain <- xgb.DMatrix(data = select(df_train, -Class) %>% as.matrix(),
+                      label = select(df_train, Class) %>% as.matrix())
+dval   <- xgb.DMatrix(data = select(df_val, -Class) %>% as.matrix(),
+                      label = select(df_val, Class) %>% as.matrix())
+
+watchlist <- list(train = dtrain, val = dval)
+```
+
+
+
+## ML Training Protocol
+
+```{r r-train}
+set.seed(7)
+xgb_model <- xgb.train(data = dtrain,
+                        max.depth = 6,
+                        eta = 0.1, 
+                        nrounds=400,
+                        watchlist=watchlist,
+                        objective = "binary:logistic",
+                        eval_metric = "logloss",
+                        early_stopping_rounds = 10)
+
+```
+
+
+
+
+```{r r-plot-loss}
+results <- xgb_model$evaluation_log 
+results <- results %>%
+  pivot_longer(cols = c(train_logloss, val_logloss),
+               names_to = "set",
+               values_to = "loss") %>%
+  mutate(set = case_when(
+    set == "train_logloss" ~ "Train",
+    set == "val_logloss" ~ "Validation"
+  ))
+
+ggplot(results) +
+  geom_line(aes(iter, loss, color = set)) + 
+  geom_vline(xintercept = 77) +
+  theme_light() + 
+  xlab("Iteration") +
+  ylab("Loss") +
+  theme (legend.title = element_blank())
+```
+
+
+
+```{r r-accuracy}
+pred <- predict(xgb_model, dtest)
+label <- getinfo(dtest, "label")
+accuracy <- as.numeric(sum(as.integer(pred > 0.5) == label)) / length(label)
+print(paste("Binomial Classification Accuracy:", accuracy * 100))
+```
+
+
+
+
+```{r r-prauc}
+pred_rocr <- prediction(pred, label)
+PRAUC <- performance(pred_rocr, "aucpr")
+rocr <- performance(pred_rocr, "prec", "rec")
+plot(rocr)
+text(x = 0.3, y = 0.4, paste0("Area under the PR curve: ", round(PRAUC@y.values[[1]], 3)))
+```
+
+
